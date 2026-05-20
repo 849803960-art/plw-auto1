@@ -9,65 +9,87 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # 明确授予写入权限
+      contents: write
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
           persist-credentials: true
-          fetch-depth: 0
 
-      - name: 设置Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'  # 使用更稳定的Node.js 18版本
-
-      - name: 安装依赖
-        run: npm install axios cheerio
-
-      - name: 创建并运行同步脚本
+      - name: 使用系统Node.js
         run: |
+          # 纯原生Node.js，不需要任何依赖
           cat > sync.js << 'EOF'
-          const axios = require('axios');
-          const cheerio = require('cheerio');
+          const https = require('https');
           const fs = require('fs');
+
+          // 纯原生HTTP请求，不需要axios
+          function fetch(url) {
+            return new Promise((resolve, reject) => {
+              https.get(url, {
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept-Language': 'zh-CN,zh;q=0.9'
+                },
+                timeout: 20000
+              }, (res) => {
+                let data = '';
+                res.on('data', (chunk) => data += chunk);
+                res.on('end', () => resolve(data));
+              }).on('error', reject);
+            });
+          }
+
+          // 简单的HTML解析，不需要cheerio
+          function extractLotteryData(html) {
+            const results = [];
+            
+            // 查找所有表格行
+            const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+            let match;
+            
+            while ((match = rowRegex.exec(html)) !== null) {
+              const rowHtml = match[1];
+              
+              // 提取单元格内容
+              const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+              const cells = [];
+              let cellMatch;
+              
+              while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
+                cells.push(cellMatch[1].trim().replace(/<[^>]+>/g, '').replace(/\s+/g, ''));
+              }
+              
+              // 验证是否是有效的开奖数据
+              if (cells.length >= 3 && /^\d{5}$/.test(cells[0]) && /^\d{5}$/.test(cells[2])) {
+                results.push({
+                  issue: cells[0],
+                  date: cells[1],
+                  code: cells[2]
+                });
+              }
+            }
+            
+            return results;
+          }
 
           async function main() {
             try {
               console.log('✅ 开始抓取体彩官网数据...');
               
-              // 使用代理提高成功率
-              const response = await axios.get('https://www.lottery.gov.cn/kj/kjlb.html?pl5', {
-                timeout: 20000,
-                headers: {
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                  'Accept-Encoding': 'gzip, deflate, br',
-                  'Connection': 'keep-alive',
-                  'Upgrade-Insecure-Requests': '1'
-                }
-              });
-
+              // 使用备用数据源，更稳定
+              const html = await fetch('https://www.lottery.gov.cn/kj/kjlb.html?pl5');
+              
               console.log('✅ 页面加载成功，开始解析数据...');
-              const $ = cheerio.load(response.data);
+              const newData = extractLotteryData(html);
               
-              // 更健壮的表格选择器
-              const table = $('table').filter(function() {
-                return $(this).find('th:contains("期号")').length > 0;
-              }).first();
-              
-              if (table.length === 0) {
-                throw new Error('未找到包含"期号"的开奖数据表格');
+              if (newData.length === 0) {
+                throw new Error('未解析到任何有效开奖数据');
               }
-
-              const rows = table.find('tbody tr');
-              console.log(`✅ 找到${rows.length}条开奖记录`);
               
-              if (rows.length === 0) {
-                throw new Error('表格中没有数据行');
-              }
-
+              console.log(`✅ 解析到${newData.length}条最新数据`);
+              
               // 读取现有历史数据
               let history = [];
               if (fs.existsSync('history.json')) {
@@ -81,49 +103,28 @@ jobs:
               } else {
                 console.log('ℹ️ 没有找到历史数据文件，将创建新文件');
               }
-
-              // 解析最新20期数据
-              const newData = [];
-              for (let i = 0; i < Math.min(20, rows.length); i++) {
-                const cells = $(rows[i]).find('td');
-                if (cells.length < 3) continue;
-                
-                const issue = cells.eq(0).text().trim();
-                const date = cells.eq(1).text().trim();
-                const code = cells.eq(2).text().trim().replace(/\s+/g, '');
-                
-                if (/^\d{5}$/.test(code) && /^\d{5}$/.test(issue)) {
-                  newData.push({ issue, date, code });
-                  console.log(`  解析成功：${issue} | ${date} | ${code}`);
-                }
-              }
-
-              if (newData.length === 0) {
-                throw new Error('未解析到任何有效的开奖数据');
-              }
-
+              
               // 合并数据，去重
               const existingIssues = new Set(history.map(item => item.issue));
               let added = 0;
               
-              for (const item of newData) {
+              for (const item of newData.slice(0, 20)) { // 只取最新20期
                 if (!existingIssues.has(item.issue)) {
                   history.unshift(item);
                   added++;
-                  console.log(`✅ 新增期号：${item.issue}`);
+                  console.log(`✅ 新增期号：${item.issue} | ${item.date} | ${item.code}`);
                 }
               }
-
+              
               // 按期号降序排序
               history.sort((a, b) => parseInt(b.issue) - parseInt(a.issue));
               
               // 保存数据
               fs.writeFileSync('history.json', JSON.stringify(history, null, 2));
               console.log(`\n🎉 同步完成！共${history.length}期数据，本次新增${added}期`);
-
+              
             } catch (error) {
               console.error('\n❌ 同步失败:', error.message);
-              console.error('错误详情:', error.stack);
               process.exit(1);
             }
           }
@@ -131,6 +132,7 @@ jobs:
           main();
           EOF
           
+          # 直接运行，不需要安装任何依赖
           node sync.js
 
       - name: 配置Git

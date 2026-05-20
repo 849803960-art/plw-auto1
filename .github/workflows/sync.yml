@@ -1,0 +1,105 @@
+name: 自动同步排列5开奖数据
+on:
+  schedule:
+    - cron: '35 12 * * *'  # 北京时间20:35（UTC时间12:35）
+    - cron: '0 4 * * *'     # 北京时间12:00，保持仓库活跃
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: 设置Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装依赖
+        run: npm install axios cheerio
+
+      - name: 运行同步脚本
+        run: |
+          cat > sync.js << 'EOF'
+          const axios = require('axios');
+          const cheerio = require('cheerio');
+          const fs = require('fs');
+
+          async function main() {
+            try {
+              console.log('开始抓取体彩官网数据...');
+              
+              const response = await axios.get('https://www.lottery.gov.cn/kj/kjlb.html?pl5', {
+                timeout: 15000,
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+                }
+              });
+
+              const $ = cheerio.load(response.data);
+              const rows = $('table tbody tr');
+              
+              if (rows.length === 0) {
+                throw new Error('未找到开奖数据表格');
+              }
+
+              // 读取现有历史数据
+              let history = [];
+              if (fs.existsSync('history.json')) {
+                history = JSON.parse(fs.readFileSync('history.json', 'utf8'));
+              }
+
+              // 解析最新10期数据
+              const newData = [];
+              for (let i = 0; i < Math.min(10, rows.length); i++) {
+                const cells = $(rows[i]).find('td');
+                const issue = cells.eq(0).text().trim();
+                const date = cells.eq(1).text().trim();
+                const code = cells.eq(2).text().trim().replace(/\s+/g, '');
+                
+                if (/^\d{5}$/.test(code)) {
+                  newData.push({ issue, date, code });
+                }
+              }
+
+              if (newData.length === 0) {
+                throw new Error('未解析到有效开奖数据');
+              }
+
+              // 合并数据，去重
+              const existingIssues = new Set(history.map(item => item.issue));
+              let added = 0;
+              
+              for (const item of newData) {
+                if (!existingIssues.has(item.issue)) {
+                  history.unshift(item);
+                  added++;
+                  console.log(`新增期号：${item.issue} | ${item.date} | ${item.code}`);
+                }
+              }
+
+              // 保存数据
+              fs.writeFileSync('history.json', JSON.stringify(history, null, 2));
+              console.log(`同步完成！共${history.length}期数据，新增${added}期`);
+
+            } catch (error) {
+              console.error('同步失败:', error.message);
+              process.exit(1);
+            }
+          }
+
+          main();
+          EOF
+          
+          node sync.js
+
+      - name: 提交并推送更新
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.ref }}
